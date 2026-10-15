@@ -736,6 +736,9 @@ def run_node_worker(
     hb_thread = threading.Thread(target=_bg_heartbeat_loop, daemon=True)
     hb_thread.start()
 
+    logger.info("⏳ 節點已進入常駐待命狀態（每 %.1fs 輪詢，請保持此視窗開啟，隨時可按 Ctrl+C 停止）...", poll_interval)
+    idle_notice_shown = False
+
     try:
         while True:
             if stop_event.is_set():
@@ -750,13 +753,23 @@ def run_node_worker(
             if idle_only:
                 idle_sec = get_system_idle_seconds()
                 if idle_sec is None:
-                    logger.debug("無法偵測本機閒置狀態，安全起見暫停接單...")
+                    if not idle_notice_shown:
+                        logger.warning("⚠️ 無法偵測本機閒置狀態，因啟用 --idle-only 安全保護機制暫停領單（節點維持在線心跳）。")
+                        idle_notice_shown = True
                     time.sleep(poll_interval)
                     continue
                 if idle_sec < idle_threshold:
-                    logger.debug("偵測到用戶正在使用電腦 (閒置 %.1fs < %.0fs)，自動禮讓中...", idle_sec, idle_threshold)
+                    if not idle_notice_shown:
+                        logger.info(
+                            "🛡️ 閒置守護生效中：目前偵測到滑鼠/鍵盤活動 (閒置 %.1fs < %.0fs)，待電腦閒置滿 %.0fs 後將自動接單（節點已保持在線 VIP 狀態）...",
+                            idle_sec,
+                            idle_threshold,
+                            idle_threshold,
+                        )
+                        idle_notice_shown = True
                     time.sleep(poll_interval)
                     continue
+                idle_notice_shown = False
 
             claim_res = _http_post(claim_url, {"node_id": node_id, "oauth_token": oauth_token}, token=oauth_token)
             if claim_res and claim_res.get("has_task"):
