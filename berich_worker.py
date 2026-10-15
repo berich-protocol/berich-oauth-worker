@@ -1,17 +1,16 @@
 #!/usr/bin/env python3
 """BeRich 閒置 AI 訂閱額度共享節點 (Cross-Platform OAuth Subscription Worker).
 
-一句話說明：把您電腦上沒在用的 AI 月費訂閱額度（免 API Key）分享給社群，節點在線期間自動免費享 BeRich 全站台股盤中 VIP 與每日 100,000 Tokens 跨模型共享 AI 互助額度（可自由呼叫池內的 Google 4 Argon、Claude Opus 5.5、GPT-6 Astra 等 8 大模型）；若想免開機永久享有 VIP 與每日額度，可於錢包持有 $BRICH 並透過 Web3 錢包簽章驗證解鎖！
-支援跨平台（macOS / Windows / Linux）與官方 OAuth 登入：
-1. claude_code: 透過 `claude login` 共享 Claude Pro / Max 閒置額度（強制 --tools "" 純文字安全沙盒）
-2. codex: 透過 `codex login` 共享 ChatGPT Plus / Pro 閒置額度
-3. gemini_cli: 透過 `gemini` 共享 Google AI (Gemini) 閒置額度
-4. simulation: 免安裝 CLI 之本機連線測試模式
+把電腦上閒置的 AI 月費訂閱額度（免 API Key）透過本機官方 CLI 分享給社群，已登入之會員在節點保持在線期間享有 BeRich 台股盤中 VIP 與跨模型互助額度（可調用當前在線模型）。
+支援跨平台（macOS / Windows）與官方 CLI 登入：
+1. claude_code: 透過 `claude login` 共享 Claude Pro / Max 閒置額度（加上 --tools "" 停用工具）
+2. codex: 透過 `codex login` 共享 ChatGPT Plus / Pro 閒置額度（指定 read-only 與 ephemeral 參數）
+3. gemini_cli: 透過 `gemini` 共享 Google AI (Gemini) 閒置額度（指定 sandbox 與 plan 模式）
 
-三大安全保證：
-- 不碰個人檔案：零 open() 讀檔指令，且調用 CLI 時強制加上 --tools "" 關閉所有工具執行權限
-- 記憶體零留存：任務於記憶體中執行，不寫入硬碟
-- 滑鼠一動立刻暫停 (Idle Guard)：偵測到滑鼠或鍵盤操作時幾毫秒內自動暫停禮讓，只有離開電腦時才接單！
+運行機制與限制提示：
+- 執行權限限制：調用 CLI 時加上停用工具或唯讀參數，並於獨立暫存目錄執行以降低風險，但不等於完整沙盒隔離，亦不保證無本機檔案讀取。
+- 閒置守護機制 (Idle Guard)：僅於領取任務前與執行前檢查系統閒置狀態，CLI 執行中的任務不會即時中斷；支援 macOS 與 Windows，Linux 預設無法偵測閒置（回傳 None），啟用 --idle-only 在 Linux 上不會領單。
+- 在線權益：台股盤中 VIP 需先登入網站會員，在線期間生效；持幣額度需經錢包簽章驗證，持幣本身不贈送 VIP 或盤中存取權限。
 """
 
 import argparse
@@ -27,6 +26,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -52,7 +52,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("berich_node")
 
-# 惡意關鍵詞與違反 ToS 越獄黑名單過濾（防止惡意 Prompt 越獄或害號主帳號遭官方風控封禁）
+# 關鍵詞與指令過濾（降低惡意 Prompt 或違反服務條款指令之執行風險）
 DANGEROUS_PATTERNS = [
     re.compile(r"(rm\s+-rf|chmod|chown|killall|reboot|shutdown|del\s+/f|format\s+c:)", re.I),
     re.compile(r"(cat\s+~/.ssh|cat\s+/etc/shadow|id_rsa)", re.I),
@@ -60,7 +60,7 @@ DANGEROUS_PATTERNS = [
     re.compile(r"(ignore\s+all\s+previous\s+(safety\s+)?instructions|how\s+to\s+make\s+a\s+bomb|write\s+ransomware|ransomware\s+payload)", re.I),
 ]
 
-# 雙向個資與私密金鑰自動脫敏規則（相容中英混排，避免呼叫端不慎將 API Key / 私鑰 / Email 傳入陌生節點）
+# 個資與金鑰格式脫敏規則（相容中英混排，降低 API Key / 私鑰 / Email 格式傳入之風險）
 PII_REDACTION_RULES = [
     (re.compile(r"(?<![A-Za-z0-9_])sk-[A-Za-z0-9_-]{16,}(?![A-Za-z0-9_-])"), "[REDACTED_API_KEY]"),
     (re.compile(r"(?<![A-Za-z0-9_])AIza[0-9A-Za-z_-]{35}(?![0-9A-Za-z_-])"), "[REDACTED_API_KEY]"),
@@ -120,19 +120,19 @@ def redact_sensitive_pii(text: str) -> str:
 
 
 def sanitize_prompt(prompt: str) -> Tuple[bool, str]:
-    """檢查提示詞長度、是否包含惡意越獄或系統攻擊特徵，並執行雙向個資脫敏。"""
+    """檢查提示詞長度、是否包含特定指令特徵，並執行個資格式脫敏。"""
     if not isinstance(prompt, str) or not prompt.strip():
         return False, "空的提示詞。"
     if len(prompt) > MAX_PROMPT_CHARS:
-        return False, f"提示詞長度超過安全上限 ({MAX_PROMPT_CHARS} 字元)，本機沙盒拒絕執行。"
+        return False, f"提示詞長度超過安全上限 ({MAX_PROMPT_CHARS} 字元)，拒絕執行。"
     for pattern in DANGEROUS_PATTERNS:
         if pattern.search(prompt):
-            return False, f"偵測到高風險惡意指令模式 ({pattern.pattern})，本機沙盒主動拒絕執行。"
+            return False, f"偵測到高風險惡意指令模式 ({pattern.pattern})，拒絕執行。"
     return True, redact_sensitive_pii(prompt)
 
 
-def get_system_idle_seconds() -> float:
-    """取得系統滑鼠/鍵盤閒置秒數（同時支援 macOS 與 Windows，零 shell=True）。"""
+def get_system_idle_seconds() -> Optional[float]:
+    """取得系統滑鼠/鍵盤閒置秒數（支援 macOS 與 Windows，不使用 shell=True）。若無法偵測則回傳 None。"""
     sys_name = platform.system()
     if sys_name == "Darwin":
         try:
@@ -145,9 +145,9 @@ def get_system_idle_seconds() -> float:
             match = re.search(r'"HIDIdleTime"\s*=\s*(\d+)', out)
             if match:
                 return float(int(match.group(1)) // 1_000_000_000)
-            return 999.0
+            return None
         except Exception:
-            return 999.0
+            return None
     elif sys_name == "Windows":
         try:
             class LASTINPUTINFO(ctypes.Structure):
@@ -159,12 +159,12 @@ def get_system_idle_seconds() -> float:
                 millis = ctypes.windll.kernel32.GetTickCount() - lii.dwTime
                 return max(0.0, float(millis) / 1000.0)
         except Exception:
-            return 999.0
-    return 999.0
+            return None
+    return None
 
 
 class LocalCLIBridge:
-    """本機 OAuth 訂閱 CLI 安全沙盒橋接器（支援 macOS / Windows / Linux 與獨立空白目錄無痕隔離）。"""
+    """本機 OAuth 訂閱 CLI 橋接器（支援 macOS / Windows，透過空白臨時目錄與參數限制降低風險）。"""
 
     @staticmethod
     def _find_bin(name: str) -> Optional[str]:
@@ -226,7 +226,7 @@ class LocalCLIBridge:
 
     @staticmethod
     def _build_sanitized_env(isolated_cwd: str) -> Dict[str, str]:
-        """建立最小化無痕環境變數：強制移除所有付費 API Key 與敏感憑證，僅保留 OAuth CLI 運行所需基礎變數。"""
+        """建立最小化環境變數：移除付費 API Key 等變數，僅保留 CLI 運行所需基礎變數。"""
         allowed_keys = {
             "PATH", "HOME", "USER", "LOGNAME", "SHELL", "LANG", "LC_ALL", "TERM",
             "USERPROFILE", "APPDATA", "LOCALAPPDATA", "PROGRAMDATA", "SYSTEMROOT",
@@ -252,7 +252,7 @@ class LocalCLIBridge:
         provider: str,
         timeout: float,
     ) -> Tuple[str, int]:
-        """於每次獨立建立之空白 TemporaryDirectory 中執行 CLI，透過 stdin 傳入 Prompt 徹底杜絕參數注入與環境變數展開。"""
+        """於每次獨立建立之空白 TemporaryDirectory 中執行 CLI，透過 stdin 傳入 Prompt 降低參數注入與環境變數展開風險。"""
         try:
             with tempfile.TemporaryDirectory(prefix="berich_sbx_") as isolated_cwd:
                 sanitized_env = cls._build_sanitized_env(isolated_cwd)
@@ -290,8 +290,8 @@ class LocalCLIBridge:
             return f"__ERROR__:AUTH_REQUIRED:{provider}", 0
 
     @classmethod
-    def execute_claude_code(cls, prompt: str, timeout: float = 60.0) -> Tuple[str, int]:
-        """調用本機 OAuth 授權之 Claude Code CLI（純文字零工具沙盒 + 無痕不落盤 + stdin 隔離輸入）。"""
+    def execute_claude_code(cls, prompt: str, model: str = "default", timeout: float = 60.0) -> Tuple[str, int]:
+        """調用本機 OAuth 授權之 Claude Code CLI（停用工具 + plan 權限模式 + 獨立目錄執行）。"""
         is_safe, clean_prompt = sanitize_prompt(prompt)
         if not is_safe:
             return "__ERROR__:TOS_REJECTED", 0
@@ -310,11 +310,13 @@ class LocalCLIBridge:
             "--disable-slash-commands",
             "--setting-sources", "",
         ]
+        if model and model != "default":
+            cmd.extend(["--model", model])
         return cls._run_sandboxed_cli(cmd, clean_prompt, "claude_code", timeout)
 
     @classmethod
-    def execute_codex(cls, prompt: str, timeout: float = 60.0) -> Tuple[str, int]:
-        """調用本機 OAuth 授權之 OpenAI Codex CLI（強制 read-only 沙盒 + 無痕 ephemeral + stdin 隔離輸入）。"""
+    def execute_codex(cls, prompt: str, model: str = "default", timeout: float = 60.0) -> Tuple[str, int]:
+        """調用本機 OAuth 授權之 OpenAI Codex CLI（指定 read-only 與 ephemeral 參數 + 獨立目錄執行）。"""
         is_safe, clean_prompt = sanitize_prompt(prompt)
         if not is_safe:
             return "__ERROR__:TOS_REJECTED", 0
@@ -330,11 +332,13 @@ class LocalCLIBridge:
             "--skip-git-repo-check",
             "-",
         ]
+        if model and model != "default":
+            cmd.extend(["-m", model])
         return cls._run_sandboxed_cli(cmd, clean_prompt, "codex", timeout)
 
     @classmethod
-    def execute_gemini_cli(cls, prompt: str, timeout: float = 60.0) -> Tuple[str, int]:
-        """調用本機 Google OAuth 授權之 Gemini CLI（強制 sandbox + plan 唯讀模式 + 禁用擴充與 MCP + stdin 隔離輸入）。"""
+    def execute_gemini_cli(cls, prompt: str, model: str = "default", timeout: float = 60.0) -> Tuple[str, int]:
+        """調用本機 Google OAuth 授權之 Gemini CLI（指定 sandbox 與 plan 模式 + 停用擴充 + 獨立目錄執行）。"""
         is_safe, clean_prompt = sanitize_prompt(prompt)
         if not is_safe:
             return "__ERROR__:TOS_REJECTED", 0
@@ -348,16 +352,27 @@ class LocalCLIBridge:
             "-e", "none",
             "-p", "",
         ]
+        if model and model != "default":
+            cmd.extend(["-m", model])
         return cls._run_sandboxed_cli(cmd, clean_prompt, "gemini_cli", timeout)
 
 
-def _http_post(url: str, payload: Dict[str, Any], timeout: float = 10.0) -> Optional[Dict[str, Any]]:
-    """以 Python 內建標準庫執行 HTTP POST（零第三方套件依賴，macOS / Windows 開箱即跑）。"""
+def _http_post(
+    url: str,
+    payload: Dict[str, Any],
+    timeout: float = 10.0,
+    token: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """以 Python 內建標準庫執行 HTTP POST（僅使用標準庫，macOS / Windows 開箱即跑）。"""
     data_bytes = json.dumps(payload).encode("utf-8")
+    headers = {"Content-Type": "application/json", "User-Agent": "berich-oauth-worker/3.0"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+        headers["X-OAuth-Token"] = token
     req = urllib.request.Request(
         url,
         data=data_bytes,
-        headers={"Content-Type": "application/json", "User-Agent": "berich-oauth-worker/3.0"},
+        headers=headers,
         method="POST",
     )
     try:
@@ -367,6 +382,8 @@ def _http_post(url: str, payload: Dict[str, Any], timeout: float = 10.0) -> Opti
                 return json.loads(body)
     except urllib.error.HTTPError as e:
         logger.error("HTTP 錯誤 %s: %s", e.code, e.reason)
+        if e.code in (401, 403):
+            return {"status": "revoked", "error": "AUTH_FATAL", "code": e.code, "message": str(e.reason)}
     except Exception as e:
         logger.warning("連線伺服器異常 (%s): %s", url, e)
     return None
@@ -412,14 +429,19 @@ def run_node_worker(
                 "provider_type": ",".join(selected_provs),
                 "os_name": platform.system(),
             },
+            token=oauth_token,
         )
-        if v_res and v_res.get("status") == "verified":
+        if v_res and (v_res.get("valid_token") or v_res.get("status") in ("verified", "online", "waiting")):
             node_id = v_res.get("node_id") or node_id
             if v_res.get("wallet_address") and not wallet_address:
                 wallet_address = v_res.get("wallet_address")
             logger.info("🔑 Berich OAuth 帳號授權驗證通過！已掛載訂閱: %s", ", ".join(selected_provs))
+        else:
+            err_msg = (v_res.get("message") if v_res else None) or "憑證驗證失敗或已被撤銷"
+            logger.error("❌ 節點憑證驗證失敗: %s", err_msg)
+            return
 
-    # 依多選訂閱類型自動合併支援之 8 大聚合模型
+    # 依多選訂閱類型自動合併候選模型清單
     if not supported_models:
         merged_models: List[str] = []
         for p in selected_provs:
@@ -442,6 +464,7 @@ def run_node_worker(
         "auth_mode": "oauth_subscription",
         "selected_providers": selected_provs,
         "detected_clis": list(LocalCLIBridge.detect_available_clis().keys()),
+        "oauth_token": oauth_token,
     }
 
     logger.info("====================================================")
@@ -450,7 +473,7 @@ def run_node_worker(
     logger.info("  節點 ID : %s", node_id)
     logger.info("  訂閱類型: %s (支援多訂閱同時共享)", ", ".join(selected_provs))
     logger.info("  支援模型: %s", ", ".join(supported_models))
-    logger.info("  閒置守護: %s (閒置滿 %.0fs 才自動共享訂閱額度)", "啟用" if idle_only else "全時段接單", idle_threshold)
+    logger.info("  閒置守護: %s (閒置門檻 %.0fs，僅啟用時生效)", "啟用" if idle_only else "全時段接單", idle_threshold)
     logger.info("====================================================")
 
     reg_payload = {
@@ -458,64 +481,117 @@ def run_node_worker(
         "node_name": node_name,
         "provider_type": selected_provs[0],
         "supported_models": supported_models,
+        "oauth_token": oauth_token,
         "metadata": system_info,
     }
-    reg_res = _http_post(register_url, reg_payload)
+    reg_res = _http_post(register_url, reg_payload, token=oauth_token)
     if not reg_res:
         logger.error("無法連線至 berich 伺服器進行節點註冊: %s", server_url)
         return
+    if reg_res.get("status") in ("revoked", "cheater_banned") or reg_res.get("error") == "AUTH_FATAL":
+        logger.error("🚨 節點註冊失敗：授權憑證已被撤銷或拒絕存取 (%s)", reg_res.get("message") or reg_res.get("error"))
+        return
+    if reg_res.get("status") != "success":
+        logger.error("❌ 節點註冊未成功: %s", reg_res.get("message") or reg_res.get("error") or "未知錯誤")
+        return
 
-    logger.info("✅ 節點已上線並加入聚合 API 供給池（在線期間自動享全站台股 VIP 與每日 100,000 Tokens 跨模型互助額度）")
+    masked_k = reg_res.get("masked_gateway_key")
+    if reg_res.get("gateway_ready") and masked_k:
+        api_path = reg_res.get("api_base_path") or "/api/v1"
+        api_url = f"{server_url}{api_path}"
+        online_models = reg_res.get("available_models", [])
+        logger.info("🎉 節點已通過自動認證上線！專屬 API Key 準備就緒: %s", masked_k)
+        logger.info("📡 API Base URL: %s", api_url)
+        if online_models:
+            logger.info("🤖 目前可用在線模型: %s", ", ".join(online_models))
+        else:
+            logger.info("🤖 目前聚合池無在線模型")
+    else:
+        # 向後相容舊伺服器未回傳 gateway_ready 之響應，不虛假宣稱金鑰已核發或保證 VIP
+        logger.info("✅ 節點連線已接受（金鑰就緒狀態無法自伺服器取得，請至網頁確認）")
 
     if wallet_address:
         bind_url = f"{server_url}/api/compute/nodes/bind_wallet"
-        b_res = _http_post(bind_url, {"node_id": node_id, "wallet_address": wallet_address})
+        b_res = _http_post(
+            bind_url,
+            {"node_id": node_id, "wallet_address": wallet_address, "oauth_token": oauth_token},
+            token=oauth_token,
+        )
         if b_res and b_res.get("status") == "success":
             logger.info("🔗 節點已綁定 Base 錢包地址: %s", wallet_address)
 
     cycle_count = 0
-    last_heartbeat = time.time()
+    stop_event = threading.Event()
+
+    def _bg_heartbeat_loop():
+        while not stop_event.is_set():
+            stop_event.wait(10.0)
+            if stop_event.is_set():
+                break
+            try:
+                hb_res = _http_post(
+                    heartbeat_url,
+                    {"node_id": node_id, "oauth_token": oauth_token},
+                    timeout=5.0,
+                    token=oauth_token,
+                )
+                if hb_res and hb_res.get("status") in ("revoked", "cheater_banned"):
+                    logger.warning("節點已被伺服器註銷或撤銷，停止常駐心跳。")
+                    stop_event.set()
+                    break
+            except Exception:
+                pass
+
+    hb_thread = threading.Thread(target=_bg_heartbeat_loop, daemon=True)
+    hb_thread.start()
 
     try:
         while True:
+            if stop_event.is_set():
+                logger.warning("節點憑證已失效或已被撤銷，停止常駐循環。")
+                break
+
             cycle_count += 1
             if max_cycles and cycle_count > max_cycles:
                 logger.info("已達最大測試輪數 (%d)，節點安全停止。", max_cycles)
                 break
 
-            now = time.time()
-            if now - last_heartbeat >= 15.0:
-                _http_post(heartbeat_url, {"node_id": node_id})
-                last_heartbeat = now
-
             if idle_only:
                 idle_sec = get_system_idle_seconds()
+                if idle_sec is None:
+                    logger.debug("無法偵測本機閒置狀態，安全起見暫停接單...")
+                    time.sleep(poll_interval)
+                    continue
                 if idle_sec < idle_threshold:
                     logger.debug("偵測到用戶正在使用電腦 (閒置 %.1fs < %.0fs)，自動禮讓中...", idle_sec, idle_threshold)
                     time.sleep(poll_interval)
                     continue
 
-            claim_res = _http_post(claim_url, {"node_id": node_id})
+            claim_res = _http_post(claim_url, {"node_id": node_id, "oauth_token": oauth_token}, token=oauth_token)
             if claim_res and claim_res.get("has_task"):
                 task_id = claim_res["task_id"]
                 prompt = claim_res["prompt"]
                 model = (claim_res.get("model") or "default").lower()
                 logger.info("⚡ 收到外部聚合 API 請求任務: %s (模型: %s)", task_id, model)
 
-                # 若領取任務瞬間號主突然操作滑鼠/鍵盤，立即無損退回任務 (TASK_YIELDED) 轉交下一位節點
-                if idle_only and get_system_idle_seconds() < idle_threshold:
-                    logger.info("🛑 偵測到號主開始操作電腦，立即退回任務 %s 交由下一位節點無縫接手...", task_id)
-                    _http_post(
-                        submit_url,
-                        {
-                            "node_id": node_id,
-                            "task_id": task_id,
-                            "result": "",
-                            "token_count": 0,
-                            "error": "TASK_YIELDED:user_active",
-                        },
-                    )
-                    continue
+                # 若領取任務瞬間號主操作滑鼠/鍵盤，立即退回任務 (TASK_YIELDED)
+                if idle_only:
+                    cur_idle = get_system_idle_seconds()
+                    if cur_idle is None or cur_idle < idle_threshold:
+                        logger.info("🛑 偵測到號主操作電腦或閒置偵測失效 (cur_idle=%s)，立即退回任務 %s 交由下一位節點接手...", cur_idle, task_id)
+                        _http_post(
+                            submit_url,
+                            {
+                                "node_id": node_id,
+                                "task_id": task_id,
+                                "result": "",
+                                "token_count": 0,
+                                "error": "TASK_YIELDED:user_active",
+                                "oauth_token": oauth_token,
+                            },
+                            token=oauth_token,
+                        )
+                        continue
 
                 # 依請求模型或已勾選訂閱自動選擇對應之 OAuth CLI 執行
                 target_prov = selected_provs[0]
@@ -531,14 +607,14 @@ def run_node_worker(
 
                 start_exec = time.time()
                 if target_prov == "claude_code":
-                    logger.info("  -> 調用本機 Claude Pro/Max OAuth 訂閱沙盒...")
-                    output_text, token_count = LocalCLIBridge.execute_claude_code(prompt)
+                    logger.info("  -> 調用本機 Claude Pro/Max OAuth 訂閱 (模型: %s)...", model)
+                    output_text, token_count = LocalCLIBridge.execute_claude_code(prompt, model=model)
                 elif target_prov == "codex":
-                    logger.info("  -> 調用本機 ChatGPT Plus/Pro (Codex OAuth) 訂閱沙盒...")
-                    output_text, token_count = LocalCLIBridge.execute_codex(prompt)
+                    logger.info("  -> 調用本機 ChatGPT Plus/Pro (Codex OAuth) 訂閱 (模型: %s)...", model)
+                    output_text, token_count = LocalCLIBridge.execute_codex(prompt, model=model)
                 elif target_prov == "gemini_cli":
-                    logger.info("  -> 調用本機 Google Gemini OAuth 訂閱沙盒...")
-                    output_text, token_count = LocalCLIBridge.execute_gemini_cli(prompt)
+                    logger.info("  -> 調用本機 Google Gemini OAuth 訂閱 (模型: %s)...", model)
+                    output_text, token_count = LocalCLIBridge.execute_gemini_cli(prompt, model=model)
                 else:
                     output_text, token_count = f"__ERROR__:AUTH_REQUIRED:{target_prov}", 0
 
@@ -561,8 +637,9 @@ def run_node_worker(
                         "result": "",
                         "token_count": 0,
                         "error": err_code,
+                        "oauth_token": oauth_token,
                     }
-                    _http_post(submit_url, submit_payload)
+                    _http_post(submit_url, submit_payload, token=oauth_token)
                     continue
 
                 submit_payload = {
@@ -570,22 +647,33 @@ def run_node_worker(
                     "task_id": task_id,
                     "result": output_text,
                     "token_count": token_count,
+                    "oauth_token": oauth_token,
                 }
-                sub_res = _http_post(submit_url, submit_payload)
+                sub_res = _http_post(submit_url, submit_payload, token=oauth_token)
+                if sub_res and sub_res.get("status") in ("revoked", "cheater_banned"):
+                    logger.error("🚨 節點憑證已被伺服器撤銷，終止運行。")
+                    stop_event.set()
+                    break
                 if sub_res and sub_res.get("status") == "success":
                     total_earned = float(sub_res.get("credits_earned", 0.0))
                     logger.info(
-                        "🎉 任務 %s 完成回傳！耗時 %.2fs | 貢獻 %d 訂閱額度 Tokens | 累計貢獻點數: %.2f (在線期間自動享台股 VIP 與跨模型互助額度)",
+                        "🎉 任務 %s 完成回傳！耗時 %.2fs | 貢獻 %d 訂閱額度 Tokens | 累計貢獻點數: %.2f (已登入會員在線享台股 VIP 與互助額度)",
                         task_id,
                         elapsed,
                         token_count,
                         total_earned,
                     )
             else:
+                if claim_res and claim_res.get("status") in ("revoked", "cheater_banned"):
+                    logger.error("🚨 節點憑證已被伺服器撤銷，終止接單。")
+                    stop_event.set()
+                    break
                 time.sleep(poll_interval)
 
     except KeyboardInterrupt:
         logger.info("\n使用者終止節點程式，正在退出...")
+    finally:
+        stop_event.set()
     logger.info("節點已安全離線。")
 
 
@@ -598,7 +686,7 @@ def main():
 
     anon_host = _get_anonymous_host_hash()
     parser = argparse.ArgumentParser(
-        description="berich 跨平台 OAuth 訂閱額度共享程式 (支援 macOS / Windows 共享閒置 Claude / ChatGPT / Gemini 訂閱，在線享台股 VIP 與跨模型互助額度)"
+        description="berich 跨平台 OAuth 訂閱額度共享程式 (支援 macOS / Windows 共享閒置 Claude / ChatGPT / Gemini 訂閱，已登入會員在線享台股盤中 VIP 與互助額度)"
     )
     parser.add_argument("--server-url", default="http://localhost:8000", help="berich 後端 API URL")
     parser.add_argument("--node-id", default=f"node-{anon_host}", help="節點唯一識別碼")
@@ -614,7 +702,7 @@ def main():
     parser.add_argument("--idle-only", action="store_true", help="啟用閒置避讓：僅在滑鼠鍵盤閒置時才共享訂閱額度")
     parser.add_argument("--idle-threshold", type=float, default=60.0, help="判定電腦閒置的秒數閾值（預設 60 秒）")
     parser.add_argument("--interval", type=float, default=2.0, help="輪詢間隔（秒）")
-    parser.add_argument("--wallet", default=None, help="Base 鏈錢包地址 (0x...)，用於關聯節點之在線 VIP 與跨模型互助額度權益")
+    parser.add_argument("--wallet", default=None, help="Base 鏈錢包地址 (0x...)，用於關聯節點之互助額度權益")
     parser.add_argument("--max-cycles", type=int, default=None, help="最大執行輪數（測試用途）")
     parser.add_argument("--once", action="store_true", help="僅執行單輪連線與任務檢查即結束（快速驗證用途）")
     args = parser.parse_args()

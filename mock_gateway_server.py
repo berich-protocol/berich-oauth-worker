@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
-"""BeRich 聚合 API 網關與算力協調器 (Open-Source Reference Gateway Server).
+"""BeRich 本地 Mock 參考網關 (Open-Source Local Mock Reference Gateway Server).
 
-本程式為 100% Python 標準庫實現之輕量級聚合網關參考伺服器（零第三方依賴），
-用於獨立驗證 `berich_worker.py` 的完整端到端流程：
-1. 驗證 Worker OAuth 綁定憑證 (`/api/compute/oauth/verify_worker`)
-2. 接收跨平台 Worker 節點註冊、多選訂閱模型掛載與心跳 (`/api/compute/nodes/*`)
-3. 開放標準 OpenAI 相容端點 (`/v1/models`, `/v1/chat/completions`) 供外部開發者呼叫
-4. 自動將外部請求路由至對應訂閱（Claude / Codex / Gemini）之 Worker 節點並記錄在線互助貢獻
+本程式為 100% Python 標準庫實現之本地離線 Mock 參考伺服器（零第三方依賴），
+僅供本地離線模擬與參考驗證 berich_worker.py 介面協定與資料結構，
+絕不等於生產環境之真實身分驗證、風控判定、真實配額扣抵或結算系統：
+1. 本地模擬驗證 Worker 憑證格式 (/api/compute/oauth/verify_worker)
+2. 接收本地 Worker 節點註冊、候選模型掛載與心跳 (/api/compute/nodes/*)
+3. 本地模擬標準 OpenAI 相容端點 (/v1/models, /v1/chat/completions)
+4. 模擬將請求轉派至註冊之 Worker 節點並回傳測試數據
 """
 
 import json
@@ -112,7 +113,7 @@ class ReferenceGatewayState:
                 return {"has_task": False}
             if node.get("status") == "busy":
                 return {"has_task": False}
-            # 5 小時滾動視窗 75% 軟上限保護（預留 25% 給號主自用）
+            # 模擬75%軟上限（非官方餘額或保留額度保證）
             soft_cap = int(node.get("window_soft_limit", 150_000) * node.get("max_share_ratio", 0.75))
             if node.get("window_tokens_used", 0) >= soft_cap:
                 return {"has_task": False}
