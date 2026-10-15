@@ -452,10 +452,10 @@ class LocalCLIBridge:
             "--ignore-user-config",
             "--ignore-rules",
             "--skip-git-repo-check",
-            "-",
         ]
         if model and model != "default":
             cmd.extend(["-m", model])
+        cmd.append("-")
         return cls._run_sandboxed_cli(cmd, clean_prompt, "codex", timeout)
 
     @classmethod
@@ -494,13 +494,33 @@ def _is_safe_endpoint_url(url: str) -> bool:
     return False
 
 
+class _SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """於轉址發送前預先攔截跨網域或降級至 HTTP 之 3xx Redirect，防止 Authorization Bearer 憑證外洩。"""
+
+    def redirect_request(self, req: Any, fp: Any, code: int, msg: str, headers: Any, newurl: str) -> Any:
+        old_parsed = urllib.parse.urlparse(req.full_url)
+        new_parsed = urllib.parse.urlparse(newurl)
+        if (new_parsed.scheme, new_parsed.netloc) != (old_parsed.scheme, old_parsed.netloc) or not _is_safe_endpoint_url(newurl):
+            raise urllib.error.HTTPError(
+                newurl,
+                code,
+                "Cross-origin or scheme-downgrade redirect blocked",
+                headers,
+                fp,
+            )
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+_SAFE_HTTP_OPENER = urllib.request.build_opener(_SafeRedirectHandler())
+
+
 def _http_post(
     url: str,
     payload: Dict[str, Any],
     timeout: float = 10.0,
     token: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
-    """以 Python 內建標準庫執行 HTTP POST（強制驗證 HTTPS 或本機迴路，並阻擋跨網域轉址憑證外洩）。"""
+    """以 Python 內建標準庫執行 HTTP POST（強制驗證 HTTPS 或本機迴路，並在轉址發送前阻擋跨網域憑證外洩）。"""
     if not _is_safe_endpoint_url(url):
         logger.error("🚨 安全攔截：拒絕連線至非 HTTPS 之遠端不安全網址 (%s)", url)
         return None
@@ -517,7 +537,7 @@ def _http_post(
         method="POST",
     )
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with _SAFE_HTTP_OPENER.open(req, timeout=timeout) as resp:
             resp_url = getattr(resp, "url", None) or (resp.geturl() if hasattr(resp, "geturl") else url)
             if isinstance(resp_url, str) and resp_url:
                 resp_parsed = urllib.parse.urlparse(resp_url)
