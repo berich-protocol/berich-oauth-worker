@@ -79,13 +79,13 @@ Visit **[`https://berich.cc/compute`](https://berich.cc/compute)** to explore th
   - Requires Web3 wallet signature verification and balance confirmation. **Holding tokens alone never grants VIP or intraday access!**
   - Holding quota formula: `int(balance * 0.5)`.
   - Normal daily cap: `max(3,000, holding quota)`.
-  - Balance >= 50,000 $BRICH: Quota floor of 25,000 Tokens/day: `max(25,000, holding quota)`; valid non-contributor VIP members may also receive a 25,000 floor.
+  - Balance >= 50,000 $BERICH: Quota floor of 25,000 Tokens/day: `max(25,000, holding quota)`; valid non-contributor VIP members may also receive a 25,000 floor.
   - **Important Rule: Online sharing quota and holding quota take the maximum (`max()`), NOT the sum!**
   - Benchmark Examples (the formula supports continuous intermediate balances, not fixed rigid tiers):
-    - 0 $BRICH: 3,000 Tokens/day
-    - 50,000 $BRICH: 25,000 Tokens/day
-    - 200,000 $BRICH: 100,000 Tokens/day
-    - 2,000,000 $BRICH: 1,000,000 Tokens/day
+    - 0 $BERICH: 3,000 Tokens/day
+    - 50,000 $BERICH: 25,000 Tokens/day
+    - 200,000 $BERICH: 100,000 Tokens/day
+    - 2,000,000 $BERICH: 1,000,000 Tokens/day
 - **Quota Reset Time**: 08:00 Taiwan Time daily (00:00 UTC).
 - **Offline Node State**: If a worker disconnects or its credential is revoked, online sharing quota is lost immediately, falling back to verified holdings quota or the base quota. Offline workers do not accumulate VIP days.
 
@@ -100,7 +100,7 @@ Authenticated members receive Taiwan Stock Intraday VIP while their node is acti
 ### 3. Worker Credits & Incentives
 - Registration or read-only verification yields no immediate rewards.
 - Logged credits reflect actual successfully completed inference tasks settled by the backend; they do not guarantee onchain withdrawal, minting, or investment income.
-- Token Contract (Base): `0x86D4854150c11b606081f8101Bf239A0c110999E` (provided solely for technical identification; not financial or investment advice).
+- Token Contract (Robinhood): `0xf54e1870A77A2209d960470f2A787Cbf0046536C` ([Official Virtuals Page](https://app.virtuals.io/virtuals/144934); provided solely for technical identification; not financial or investment advice).
 
 ---
 
