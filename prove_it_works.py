@@ -146,15 +146,17 @@ def proof_2_cross_platform_and_idle_guard() -> None:
         assert win_bin == "C:\\Users\\Demo\\AppData\\Roaming\\npm\\claude.cmd"
     print("  ✅ Windows 執行檔後綴比對驗證：模擬解析 `claude.cmd` / `codex.cmd` / `gemini.cmd`")
 
-    # 4. 驗證 Claude CLI 強制附加 `--tools ""`、`--strict-mcp-config`、stdin 管道輸入及獨立 `berich_sbx_` 暫存目錄隔離
+    # 4. 驗證 Claude / Codex / Gemini CLI 參數拼裝、零歷史環境變數 (HISTFILE=/dev/null) 及獨立 `berich_sbx_` 暫存目錄隔離
     captured_cmds: List[List[str]] = []
     captured_cwds: List[str] = []
     captured_inputs: List[str] = []
+    captured_envs: List[Dict[str, str]] = []
 
     def fake_run(cmd: List[str], **kwargs: Any) -> Any:
         captured_cmds.append(cmd)
         captured_cwds.append(str(kwargs.get("cwd", "")))
         captured_inputs.append(str(kwargs.get("input", "")))
+        captured_envs.append(dict(kwargs.get("env") or {}))
         mock_res = MagicMock()
         mock_res.returncode = 0
         mock_res.stdout = "Sandbox output verified"
@@ -162,14 +164,31 @@ def proof_2_cross_platform_and_idle_guard() -> None:
         return mock_res
 
     with patch("subprocess.run", side_effect=fake_run):
-        out, tokens = berich_worker.LocalCLIBridge.execute_claude_code("Analyze TSMC 2330 chip flow")
+        out, tokens = berich_worker.LocalCLIBridge.execute_claude_code("Analyze TSMC 2330 chip flow", model="claude-sonnet-5-5")
         assert out == "Sandbox output verified"
         assert len(captured_cmds) == 1
         cmd_executed = captured_cmds[0]
+        env_executed = captured_envs[0]
         assert "--tools" in cmd_executed and "" in cmd_executed
+        assert "--strict-mcp-config" in cmd_executed
         assert "berich_sbx_" in captured_cwds[0]
         assert captured_inputs[0] == "Analyze TSMC 2330 chip flow"
-    print(f"  ✅ CLI 參數與臨時目錄 (`{captured_cwds[0]}`) 拼裝檢查通過：實際執行參數 = {cmd_executed}")
+        assert env_executed.get("HISTFILE") == "/dev/null"
+        assert env_executed.get("HISTSIZE") == "0"
+        assert env_executed.get("SAVEHIST") == "0"
+        assert env_executed.get("NODE_REPL_HISTORY") == ""
+        assert env_executed.get("PYTHONHISTFILE") == "/dev/null"
+        assert env_executed.get("DO_NOT_TRACK") == "1"
+        assert env_executed.get("ANONYMIZED_TELEMETRY") == "false"
+        assert env_executed.get("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC") == "1"
+
+        # 驗證 Codex CLI 參數順序 (-m <model> 位於 stdin 標記 `-` 之前)
+        out_cx, _ = berich_worker.LocalCLIBridge.execute_codex("Analyze 2454", model="gpt-6-astra")
+        assert out_cx == "Sandbox output verified"
+        codex_cmd = captured_cmds[1]
+        assert codex_cmd[-3:] == ["-m", "gpt-6-astra", "-"], f"Codex 參數順序異常: {codex_cmd}"
+        assert "--sandbox" in codex_cmd and "read-only" in codex_cmd and "--ephemeral" in codex_cmd
+    print(f"  ✅ CLI 參數、零歷史環境變數 (`HISTFILE=/dev/null`) 與臨時目錄 (`{captured_cwds[0]}`) 拼裝檢查通過")
 
 
 def proof_3_and_4_e2e_multi_subscription_gateway() -> None:
@@ -490,7 +509,7 @@ def proof_6_tos_firewall_and_pii_redaction() -> None:
             pass
     print("  ✅ [3] 端對端對話加密 (`br_enc_v1`) 測試通過：密文零明文外洩，且成功攔截密文竄改與跨節點/跨方向重放攻擊")
 
-    # 4. 驗證 CLI 模型參數注入防禦與遠端非 HTTPS 攔截
+    # 4. 驗證 CLI 模型參數注入防禦、遠端非 HTTPS 攔截與跨網域 302 轉址前置阻斷
     assert berich_worker.is_valid_model_name("claude-sonnet-5-5") is True
     assert berich_worker.is_valid_model_name("--dangerously-skip-permissions") is False
     assert berich_worker.is_valid_model_name("claude; rm -rf /") is False
@@ -499,7 +518,16 @@ def proof_6_tos_firewall_and_pii_redaction() -> None:
     assert berich_worker._is_safe_endpoint_url("https://api.berich.cc") is True
     assert berich_worker._is_safe_endpoint_url("http://127.0.0.1:8000") is True
     assert berich_worker._is_safe_endpoint_url("http://evil-remote.example.com") is False
-    print("  ✅ [4] 紅隊資安加固測試通過：成功攔截 CLI 模型旗標注入 (`--dangerously-skip-permissions`) 與遠端明文 HTTP 連線")
+
+    # 測試 _SafeRedirectHandler 在跟隨 302 轉址前即拋出 HTTPError，絕不將 Authorization Header 洩漏至異質網域
+    redirect_handler = berich_worker._SafeRedirectHandler()
+    orig_req = urllib.request.Request("https://berich.cc/api/compute/tasks/claim", headers={"Authorization": "Bearer bw_oauth_secret"})
+    try:
+        redirect_handler.redirect_request(orig_req, None, 302, "Found", {}, "https://evil-collector.example.com/steal")
+        raise AssertionError("跨網域 302 轉址應被 _SafeRedirectHandler 前置阻斷！")
+    except urllib.error.HTTPError as redirect_err:
+        assert "Cross-origin" in str(redirect_err.reason)
+    print("  ✅ [4] 紅隊資安加固測試通過：成功攔截 CLI 模型旗標注入 (`--dangerously-skip-permissions`)、遠端明文 HTTP 與跨網域 302 轉址")
 
 
 def main() -> int:

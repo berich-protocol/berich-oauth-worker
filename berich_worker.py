@@ -7,10 +7,17 @@
 2. codex: 透過 `codex login` 共享 ChatGPT Plus / Pro 閒置額度（指定 read-only 與 ephemeral 參數）
 3. gemini_cli: 透過 `gemini` 共享 Google AI (Gemini) 閒置額度（指定 sandbox 與 plan 模式）
 
-運行機制與限制提示：
-- 執行權限限制：調用 CLI 時加上停用工具或唯讀參數，並於獨立暫存目錄執行以降低風險，但不等於完整沙盒隔離，亦不保證無本機檔案讀取。
-- 閒置守護機制 (Idle Guard)：僅於領取任務前與執行前檢查系統閒置狀態，CLI 執行中的任務不會即時中斷；支援 macOS 與 Windows，Linux 預設無法偵測閒置（回傳 None），啟用 --idle-only 在 Linux 上不會領單。
-- 在線權益：台股盤中 VIP 需先登入網站會員，在線期間生效；持幣額度需經錢包簽章驗證，持幣本身不贈送 VIP 或盤中存取權限。
+運行機制、資安架構與限制聲明：
+1. 全對話內容點對點與記憶體加密 (br_enc_v1 AEAD)：
+   - 傳輸層與會話層雙重加密：網關派發任務（/api/compute/tasks/claim 之 prompt 完整多輪上下文）與 Worker 提交結果（/api/compute/tasks/submit 之 result）全程採用 100% Python 標準庫實作之 br_enc_v1 認證加密封裝（HKDF-SHA256 金鑰衍生 + 128-bit 隨機 Nonce + SHA256-CTR 對稱加密 + HMAC-SHA256 Encrypt-then-MAC 完整性標籤，並綁定 berich-e2ee-v1|{direction}|{task_id}|{node_id} 關聯資料 AAD），防範跨任務重放與中間人竄改。
+   - 伺服器 RAM 密文封裝與即時銷毀 (Zeroization)：調度佇列於伺服器記憶體中亦以獨立金鑰加密保存，且在推論完成並回傳呼叫端的瞬間立即從記憶體佇列抹除（零資料庫落盤、零對話日誌留存）。
+   - 本機零歷史與防注入加固：Worker 強制驗證模型參數白名單（阻擋 -- 旗標注入）、注入 HISTFILE=/dev/null 等零歷史環境變數，且絕不在終端機或錯誤日誌印出對話明文或 OAuth 憑證。
+2. 本機 CLI 調用與授權傳輸：Worker 透過本機已登入之官方 CLI 轉發推論。官方 CLI 運行時仍會讀取其本機登入憑證與設定，請求會經過調度服務與官方上游伺服器。程式透過指定空白暫存目錄與停用工具參數降低風險，但不等於完整系統沙盒隔離，亦不保證無本機檔案讀取。
+3. 前置閒置檢查機制 (Idle Guard)：閒置避讓為選用參數（網頁指令預設帶入 --idle-only，預設閾值為 60 秒 --idle-threshold 60.0）。啟用時，Worker 於任務領取前與呼叫 CLI 前雙重檢查系統閒置狀態；偵測失敗或使用者活躍時停止領單。若 CLI 已在執行中，移動滑鼠或鍵盤不會即時強制殺死進行中的 CLI 行程；待當前任務完成後，若偵測到使用者正在操作電腦，才會暫停領取新任務。若未加上 --idle-only，Worker 將處於全時段接單狀態。
+4. 跨平台閒置偵測差異：macOS 與 Windows 支援原生閒置讀取；Linux 系統目前閒置偵測回傳 None，若於 Linux 啟用 --idle-only 將因安全保護機制而無法領單，Linux 不支援完整閒置避讓模式。
+5. 服務端用量推估機制：服務端後端維持 5 小時滾動用量推估，用於社群池容量調度並設有 75% 軟上限保護，非本機 Worker 直接追蹤官方額度。此數值為服務端推估，無法查詢官方後端真實剩餘額度，亦不保證保留 25% 官方額度。
+6. 關鍵字過濾與脫敏局限：內建關鍵字過濾與正規表達式脫敏僅為輔助過濾手段，無法保證絕對安全、不保證完全去識別化。
+7. 服務條款與無封號保證 (No Ban Guarantee)：本專案為開源分散式運算技術實作，無法保證零封號風險。各 AI 供應商隨時可能更新服務條款，使用者須自行評估並承擔使用帳號之相關風險。
 """
 
 import argparse
@@ -353,11 +360,11 @@ class LocalCLIBridge:
         clean_env["TMP"] = isolated_cwd
         clean_env["CLAUDE_CODE_SAFE_MODE"] = "1"
         clean_env["CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"] = "1"
-        clean_env["HISTFILE"] = os.devnull
+        clean_env["HISTFILE"] = "/dev/null"
         clean_env["HISTSIZE"] = "0"
         clean_env["SAVEHIST"] = "0"
         clean_env["NODE_REPL_HISTORY"] = ""
-        clean_env["PYTHONHISTFILE"] = os.devnull
+        clean_env["PYTHONHISTFILE"] = "/dev/null"
         clean_env["DO_NOT_TRACK"] = "1"
         clean_env["ANONYMIZED_TELEMETRY"] = "false"
         clean_env["CI"] = "true"
@@ -797,7 +804,9 @@ def run_node_worker(
                         node_id=node_id,
                         direction="claim",
                     )
+                    raw_envelope = ""
                 except ValueError as e:
+                    raw_envelope = ""
                     logger.error("🚨 安全攔截：任務 %s 對話密文 HMAC 驗簽失敗 (%s)，拒絕執行！", task_id, e)
                     _http_post(
                         submit_url,
