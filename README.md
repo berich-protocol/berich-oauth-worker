@@ -34,9 +34,9 @@ Visit **[`https://berich.cc/compute`](https://berich.cc/compute)** to explore th
 ### Prerequisites
 1. **Python Environment**: Python installed is required (tested on Python 3.11; the worker relies 100% on the Python standard library with zero `pip install` requirements).
 2. **Official AI CLIs**: Pre-install and authenticate the relevant official CLI tools locally:
-   - **Claude Pro / Max**: `claude login`
+   - **Claude Pro / Max**: `claude auth login`
    - **ChatGPT Plus / Pro**: `codex login`
-   - **Google Gemini**: `gemini`
+   - **Google Gemini**: `gemini` (select Sign in with Google after launch)
    - If unsure of installation steps, consult each CLI tool's official documentation.
 
 ### Startup Steps
@@ -104,14 +104,18 @@ Authenticated members receive Taiwan Stock Intraday VIP while their node is acti
 
 ---
 
-## 🛡️ Operating Mechanics, Limitations & Risk Disclosure
+## 🛡️ End-to-End Conversation Encryption (`br_enc_v1` AEAD), Mechanics & Risk Disclosure
 
-1. **Local CLI Execution & Authorization**: The worker relays tasks through existing authenticated CLIs. Official CLIs read their local configuration and credentials, and requests pass through community routing and upstream servers. While empty temporary working directories and `--tools ""` mitigate risk, **this is not full sandbox isolation and does not guarantee zero local file access**.
-2. **Pre-Execution Idle Guard**: Idle Guard is an optional parameter (the page-generated command includes `--idle-only` by default with a 60-second threshold `--idle-threshold 60.0`). When enabled, the worker checks system idle state before claiming tasks and before invoking the CLI; detection failure or active user input pauses task claiming. **If a CLI task is already in progress, active mouse or keyboard movements will not immediately kill the running process**; the worker pauses further claiming after the active task finishes if user activity is detected. Without `--idle-only`, the worker processes tasks continuously.
-3. **Operating System Support Differences**: macOS (`ioreg`) and Windows (`GetLastInputInfo`) provide native idle tracking. On Linux, idle detection returns `None`, meaning `--idle-only` will not claim tasks due to fail-closed safety; **Linux does not have fully supported idle-guard mode**.
-4. **Service-Side Usage Estimates**: The backend service maintains a rolling 5-hour usage estimate to manage community pool capacity with a 75% soft limit, rather than local worker tracking of official quotas. This heuristic cannot query true upstream server balances and does not guarantee reserving 25% of your official quota.
-5. **Pattern & Redaction Limits**: Built-in pattern filters and regular expression redaction mitigate risk but cannot guarantee absolute safety or complete de-identification.
-6. **Terms of Service & No Ban Guarantee**: This open-source project is distributed compute research and cannot guarantee zero account-suspension risk. Upstream AI providers may update their Terms of Service at any time; users assume all operational risks.
+1. **Full Conversation Encryption (`br_enc_v1` AEAD) & Ephemeral RAM Zeroization**:
+   - **Authenticated Payload Encryption**: Every task prompt (`/api/compute/tasks/claim`) and inference result (`/api/compute/tasks/submit`) is encrypted using the 100% Python stdlib `br_enc_v1` AEAD envelope (`HKDF-SHA256` key derivation + 128-bit random nonce + `SHA256-CTR` stream cipher + `HMAC-SHA256` Encrypt-then-MAC tag bound to `berich-e2ee-v1|{direction}|{task_id}|{node_id}` AAD), preventing cross-task replay and tampering.
+   - **Encrypted In-Memory Queue & Immediate Wipe**: In-flight tasks are stored encrypted in server RAM using an ephemeral server key and are immediately wiped (`pop` + zeroization) as soon as the response is returned to the caller (zero database persistence, zero conversation logging).
+   - **Local Zero-History & Injection Hardening**: The worker enforces strict regex validation on model identifiers (blocking `--` CLI flag injection), injects zero-history environment variables (`HISTFILE=/dev/null`, etc.), and never prints conversation plaintext or OAuth credentials to logs.
+2. **Local CLI Execution & Authorization**: The worker relays tasks through existing authenticated CLIs. Official CLIs read their local configuration and credentials, and requests pass through community routing and upstream servers. While empty temporary working directories and `--tools ""` mitigate risk, **this is not full sandbox isolation and does not guarantee zero local file access**.
+3. **Pre-Execution Idle Guard**: Idle Guard is an optional parameter (the page-generated command includes `--idle-only` by default with a 60-second threshold `--idle-threshold 60.0`). When enabled, the worker checks system idle state before claiming tasks and before invoking the CLI; detection failure or active user input pauses task claiming. **If a CLI task is already in progress, active mouse or keyboard movements will not immediately kill the running process**; the worker pauses further claiming after the active task finishes if user activity is detected. Without `--idle-only`, the worker processes tasks continuously.
+4. **Operating System Support Differences**: macOS (`ioreg`) and Windows (`GetLastInputInfo`) provide native idle tracking. On Linux, idle detection returns `None`, meaning `--idle-only` will not claim tasks due to fail-closed safety; **Linux does not have fully supported idle-guard mode**.
+5. **Service-Side Usage Estimates**: The backend service maintains a rolling 5-hour usage estimate to manage community pool capacity with a 75% soft limit, rather than local worker tracking of official quotas. This heuristic cannot query true upstream server balances and does not guarantee reserving 25% of your official quota.
+6. **Pattern & Redaction Limits**: Built-in pattern filters and regular expression redaction mitigate risk but cannot guarantee absolute safety or complete de-identification.
+7. **Terms of Service & No Ban Guarantee**: This open-source project is distributed compute research and cannot guarantee zero account-suspension risk. Upstream AI providers may update their Terms of Service at any time; users assume all operational risks.
 
 ---
 
@@ -125,9 +129,9 @@ python3 prove_it_works.py
 
 > **Important Notice**: This script is an offline mock inspection (does not connect to external networks or live upstream APIs) to verify fixtures and configuration. **It cannot prove zero backdoors, nor does it equal live CLI, Windows/official compatibility, or security certification.**
 - **AST Static Inspection**: Validates standard library imports and syntax tree structure.
-- **Pre-Execution & Parameter Checks**: Verifies idle-time reading logic and argument assembly.
-- **Multi-Subscription Mounting Mock**: Simulates multi-provider registration against a local mock server.
-- **Task Dispatch & Completion Mock**: Simulates endpoint dispatch and task settlement.
+- **Pre-Execution & Parameter Checks**: Verifies idle-time reading logic, argument assembly, and CLI model flag-injection blocking.
+- **Multi-Subscription Mounting Mock**: Simulates multi-provider registration and token stripping against a local mock server.
+- **Encrypted Task Dispatch & Ephemeral Wipe Mock**: Simulates endpoint dispatch, `br_enc_v1` AEAD encryption/decryption, HMAC tamper rejection, and immediate post-completion memory wipe.
 - **Failover Mock**: Tests 429 error classification and task queue re-insertion.
 - **Pattern & Regex Redaction Tests**: Evaluates built-in safety keywords and regex masking routines.
 

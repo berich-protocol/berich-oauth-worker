@@ -3,7 +3,7 @@
 
 把電腦上閒置的 AI 月費訂閱額度（免 API Key）透過本機官方 CLI 分享給社群，已登入之會員在節點保持在線期間享有 BeRich 台股盤中 VIP 與跨模型互助額度（可調用當前在線模型）。
 支援跨平台（macOS / Windows）與官方 CLI 登入：
-1. claude_code: 透過 `claude login` 共享 Claude Pro / Max 閒置額度（加上 --tools "" 停用工具）
+1. claude_code: 透過 `claude auth login` 共享 Claude Pro / Max 閒置額度（加上 --tools "" 停用工具）
 2. codex: 透過 `codex login` 共享 ChatGPT Plus / Pro 閒置額度（指定 read-only 與 ephemeral 參數）
 3. gemini_cli: 透過 `gemini` 共享 Google AI (Gemini) 閒置額度（指定 sandbox 與 plan 模式）
 
@@ -14,13 +14,16 @@
 """
 
 import argparse
+import base64
 import ctypes
 import hashlib
+import hmac
 import json
 import logging
 import os
 import platform
 import re
+import secrets
 import shutil
 import socket
 import subprocess
@@ -36,6 +39,10 @@ from typing import Any, Dict, List, Optional, Tuple
 MAX_PROMPT_CHARS = 32_000
 MAX_OUTPUT_CHARS = 64_000
 MAX_HTTP_RESPONSE_BYTES = 2 * 1024 * 1024
+ENC_ENVELOPE_PREFIX = "br_enc_v1:"
+
+# 嚴格限制模型名稱格式（禁止以 - 開頭或夾帶空白/特殊字元，防止 CLI 參數注入與 Shell 注入）
+SAFE_MODEL_REGEX = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._:-]{0,63}$")
 
 # 確保 Windows PowerShell / CMD 終端機輸出繁體中文與符號不發生 cp950 編碼崩潰
 if hasattr(sys.stdout, "reconfigure"):
@@ -52,19 +59,22 @@ logging.basicConfig(
 )
 logger = logging.getLogger("berich_node")
 
-# 關鍵詞與指令過濾（降低惡意 Prompt 或違反服務條款指令之執行風險）
+# 關鍵詞與指令過濾（降低惡意 Prompt、機密竊取或違反服務條款指令之執行風險）
 DANGEROUS_PATTERNS = [
     re.compile(r"(rm\s+-rf|chmod|chown|killall|reboot|shutdown|del\s+/f|format\s+c:)", re.I),
-    re.compile(r"(cat\s+~/.ssh|cat\s+/etc/shadow|id_rsa)", re.I),
-    re.compile(r"(curl\s+.*\|\s*bash|wget\s+.*\|\s*sh|Invoke-Expression)", re.I),
-    re.compile(r"(ignore\s+all\s+previous\s+(safety\s+)?instructions|how\s+to\s+make\s+a\s+bomb|write\s+ransomware|ransomware\s+payload)", re.I),
+    re.compile(r"(cat\s+~/.ssh|cat\s+/etc/shadow|id_rsa|\.aws/credentials|\.claude|\.codex|\.gemini|\.env\b)", re.I),
+    re.compile(r"(curl\s+.*\|\s*bash|wget\s+.*\|\s*sh|Invoke-Expression|powershell\s+-enc)", re.I),
+    re.compile(r"(ignore\s+all\s+previous\s+(safety\s+)?instructions|how\s+to\s+make\s+a\s+bomb|write\s+ransomware|ransomware\s+payload|seed\s+phrase|mnemonic\s+phrase)", re.I),
 ]
 
-# 個資與金鑰格式脫敏規則（相容中英混排，降低 API Key / 私鑰 / Email 格式傳入之風險）
+# 個資與金鑰格式脫敏規則（相容中英混排，降低 API Key / 私鑰 / OAuth Token / JWT / Email 格式傳入之風險）
 PII_REDACTION_RULES = [
     (re.compile(r"(?<![A-Za-z0-9_])sk-[A-Za-z0-9_-]{16,}(?![A-Za-z0-9_-])"), "[REDACTED_API_KEY]"),
     (re.compile(r"(?<![A-Za-z0-9_])AIza[0-9A-Za-z_-]{35}(?![0-9A-Za-z_-])"), "[REDACTED_API_KEY]"),
-    (re.compile(r"(?<![A-Za-z0-9_])bw_oauth_[a-fA-F0-9]{12,}(?![a-fA-F0-9])"), "[REDACTED_OAUTH_TOKEN]"),
+    (re.compile(r"(?<![A-Za-z0-9_])(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9_]{24,}(?![A-Za-z0-9_])"), "[REDACTED_API_KEY]"),
+    (re.compile(r"(?<![A-Za-z0-9_])AKIA[0-9A-Z]{16}(?![0-9A-Z])"), "[REDACTED_API_KEY]"),
+    (re.compile(r"(?<![A-Za-z0-9_])bw_oauth_[a-fA-F0-9_]{12,}(?![a-fA-F0-9_])"), "[REDACTED_OAUTH_TOKEN]"),
+    (re.compile(r"eyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}"), "[REDACTED_JWT_TOKEN]"),
     (re.compile(r"(?<![A-Za-z0-9_])0x[a-fA-F0-9]{64}(?![a-fA-F0-9])"), "[REDACTED_PRIVATE_KEY]"),
     (re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}"), "[REDACTED_EMAIL]"),
     (re.compile(r"(?<!\d)09\d{2}[-\s]?\d{3}[-\s]?\d{3}(?!\d)"), "[REDACTED_PHONE]"),
@@ -72,7 +82,7 @@ PII_REDACTION_RULES = [
 
 # AI 訂閱額度用罄 / 速率限制 / 授權失效偵測規則（觸發時自動將任務平滑轉交給下一位使用者的節點）
 AUTH_ERROR_REGEX = re.compile(
-    r"(not\s+logged\s+in|login\s+required|please\s+run\s+claude\s+login|"
+    r"(not\s+logged\s+in|login\s+required|please\s+run\s+claude\s+(?:auth\s+)?login|"
     r"unauthorized|authentication\s+failed|invalid\s+api\s+key|session\s+expired)",
     re.I,
 )
@@ -85,6 +95,102 @@ QUOTA_EXHAUSTED_REGEX = re.compile(
     r"status\s*429|http\s*429|limit\s+reached|resets\s+at|out\s+of\s+credits|quota_exhausted)",
     re.I,
 )
+
+
+def derive_node_session_secret(node_id: str, oauth_token: Optional[str] = None) -> str:
+    """衍生節點專屬之端對端會話加密主金鑰（優先綁定 OAuth 憑證，無憑證時退回節點 ID 衍生）。"""
+    clean_token = (oauth_token or "").strip()
+    if clean_token:
+        return f"berich-oauth-key:{clean_token}"
+    return f"berich-node-key:{(node_id or '').strip()}"
+
+
+def _xor_keystream(data: bytes, enc_key: bytes, nonce: bytes) -> bytes:
+    """使用 HMAC-SHA256 計數器模式 (CTR) 產生密碼學金鑰流並進行對稱加解密（100% Python 標準庫）。"""
+    out = bytearray(len(data))
+    block_count = (len(data) + 31) // 32
+    for counter in range(block_count):
+        keystream_block = hmac.new(
+            enc_key,
+            nonce + counter.to_bytes(8, "big"),
+            hashlib.sha256,
+        ).digest()
+        offset = counter * 32
+        chunk = data[offset : offset + 32]
+        for idx, b_val in enumerate(chunk):
+            out[offset + idx] = b_val ^ keystream_block[idx]
+    return bytes(out)
+
+
+def encrypt_conversation_payload(
+    plaintext: str,
+    secret_key: str,
+    task_id: str,
+    node_id: str,
+    direction: str = "claim",
+) -> str:
+    """將完整對話內容（含多輪上下文 Prompt 與推論回應 Result）進行 AEAD 認證加密 (Encrypt-then-MAC)。
+
+    採用 HKDF-SHA256 金鑰衍生 + 128-bit 隨機 Nonce + SHA256-CTR + HMAC-SHA256 完整性防竄改標籤，
+    將關聯資料 AAD (direction | task_id | node_id) 綁定至密文，杜絕跨任務重放或中間人竄改。
+    格式：br_enc_v1:<nonce_hex>:<ciphertext_b64>:<hmac_hex>
+    """
+    raw_bytes = (plaintext or "").encode("utf-8")
+    nonce = secrets.token_bytes(16)
+    aad = f"berich-e2ee-v1|{direction}|{task_id}|{node_id}".encode("utf-8")
+    key_bytes = (secret_key or "berich-default").encode("utf-8")
+
+    # HKDF-Extract & Expand
+    prk = hmac.new(nonce, key_bytes, hashlib.sha256).digest()
+    enc_key = hmac.new(prk, b"enc|" + aad + b"\x01", hashlib.sha256).digest()
+    mac_key = hmac.new(prk, b"mac|" + aad + b"\x02", hashlib.sha256).digest()
+
+    ciphertext = _xor_keystream(raw_bytes, enc_key, nonce)
+    tag = hmac.new(mac_key, aad + b"|" + nonce + ciphertext, hashlib.sha256).hexdigest()
+    ct_b64 = base64.urlsafe_b64encode(ciphertext).decode("ascii")
+    return f"{ENC_ENVELOPE_PREFIX}{nonce.hex()}:{ct_b64}:{tag}"
+
+
+def decrypt_conversation_payload(
+    envelope: str,
+    secret_key: str,
+    task_id: str,
+    node_id: str,
+    direction: str = "claim",
+) -> str:
+    """驗證 HMAC 簽章與 AAD 綁定後解密對話內容；若遭竄改、偽造或跨節點重放則立即拋出 ValueError。"""
+    if not isinstance(envelope, str) or not envelope.startswith(ENC_ENVELOPE_PREFIX):
+        raise ValueError("Missing or invalid encryption envelope prefix (expected br_enc_v1:)")
+    parts = envelope.split(":")
+    if len(parts) != 4 or parts[0] != "br_enc_v1":
+        raise ValueError("Malformed br_enc_v1 envelope structure")
+    _, nonce_hex, ct_b64, provided_tag = parts
+    if len(nonce_hex) != 32 or len(provided_tag) != 64:
+        raise ValueError("Invalid nonce or HMAC tag length")
+    try:
+        nonce = bytes.fromhex(nonce_hex)
+        ciphertext = base64.urlsafe_b64decode(ct_b64.encode("ascii"))
+    except Exception as exc:
+        raise ValueError("Invalid hex/base64 encoding in encrypted payload") from exc
+
+    aad = f"berich-e2ee-v1|{direction}|{task_id}|{node_id}".encode("utf-8")
+    key_bytes = (secret_key or "berich-default").encode("utf-8")
+
+    prk = hmac.new(nonce, key_bytes, hashlib.sha256).digest()
+    enc_key = hmac.new(prk, b"enc|" + aad + b"\x01", hashlib.sha256).digest()
+    mac_key = hmac.new(prk, b"mac|" + aad + b"\x02", hashlib.sha256).digest()
+
+    expected_tag = hmac.new(mac_key, aad + b"|" + nonce + ciphertext, hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(expected_tag, provided_tag):
+        raise ValueError("HMAC authentication failed: conversation payload tampered or key mismatch")
+
+    plaintext_bytes = _xor_keystream(ciphertext, enc_key, nonce)
+    return plaintext_bytes.decode("utf-8")
+
+
+def is_valid_model_name(model: str) -> bool:
+    """驗證模型識別碼是否安全（禁止以 `-` 開頭或包含特殊字元，防止 CLI 旗標注入）。"""
+    return bool(model and isinstance(model, str) and SAFE_MODEL_REGEX.match(model))
 
 
 def _get_anonymous_host_hash() -> str:
@@ -123,6 +229,8 @@ def sanitize_prompt(prompt: str) -> Tuple[bool, str]:
     """檢查提示詞長度、是否包含特定指令特徵，並執行個資格式脫敏。"""
     if not isinstance(prompt, str) or not prompt.strip():
         return False, "空的提示詞。"
+    if "\x00" in prompt:
+        return False, "偵測到非法 Null Byte 字元，拒絕執行。"
     if len(prompt) > MAX_PROMPT_CHARS:
         return False, f"提示詞長度超過安全上限 ({MAX_PROMPT_CHARS} 字元)，拒絕執行。"
     for pattern in DANGEROUS_PATTERNS:
@@ -203,8 +311,9 @@ class LocalCLIBridge:
             if not bin_path:
                 logger.warning("尚未安裝 Claude Code CLI！請先執行: npm install -g @anthropic-ai/claude-code")
                 return False
-            logger.info("🔑 正在啟動 Anthropic Claude 官方 OAuth 瀏覽器授權登入 (claude login)...")
-            subprocess.run([bin_path, "login"], shell=is_win, timeout=300.0)
+            logger.info("🔑 正在啟動 Anthropic Claude 官方 OAuth 瀏覽器授權登入 (claude auth login)...")
+            use_shell = is_win and bin_path.lower().endswith((".cmd", ".bat"))
+            subprocess.run([bin_path, "auth", "login"], shell=use_shell, timeout=300.0)
             return True
         elif provider_type == "codex":
             bin_path = cls._find_bin("codex")
@@ -212,21 +321,23 @@ class LocalCLIBridge:
                 logger.warning("尚未安裝 OpenAI Codex CLI！請先執行: npm install -g @openai/codex")
                 return False
             logger.info("🔑 正在啟動 OpenAI ChatGPT Plus/Pro 官方 OAuth 瀏覽器授權登入 (codex login)...")
-            subprocess.run([bin_path, "login"], shell=is_win, timeout=300.0)
+            use_shell = is_win and bin_path.lower().endswith((".cmd", ".bat"))
+            subprocess.run([bin_path, "login"], shell=use_shell, timeout=300.0)
             return True
         elif provider_type == "gemini_cli":
             bin_path = cls._find_bin("gemini")
             if not bin_path:
                 logger.warning("尚未安裝 Google Gemini CLI！請先執行: npm install -g @google/gemini-cli")
                 return False
-            logger.info("🔑 正在啟動 Google Gemini 官方 OAuth 瀏覽器授權登入...")
-            subprocess.run([bin_path], shell=is_win, timeout=300.0)
+            logger.info("🔑 正在啟動 Google Gemini 官方 OAuth 瀏覽器授權登入 (啟動後請選擇 Sign in with Google)...")
+            use_shell = is_win and bin_path.lower().endswith((".cmd", ".bat"))
+            subprocess.run([bin_path], shell=use_shell, timeout=300.0)
             return True
         return True
 
     @staticmethod
     def _build_sanitized_env(isolated_cwd: str) -> Dict[str, str]:
-        """建立最小化環境變數：移除付費 API Key 等變數，僅保留 CLI 運行所需基礎變數。"""
+        """建立最小化環境變數：移除付費 API Key 等變數，並強制關閉本機歷史紀錄與外部遙測。"""
         allowed_keys = {
             "PATH", "HOME", "USER", "LOGNAME", "SHELL", "LANG", "LC_ALL", "TERM",
             "USERPROFILE", "APPDATA", "LOCALAPPDATA", "PROGRAMDATA", "SYSTEMROOT",
@@ -241,6 +352,14 @@ class LocalCLIBridge:
         clean_env["TEMP"] = isolated_cwd
         clean_env["TMP"] = isolated_cwd
         clean_env["CLAUDE_CODE_SAFE_MODE"] = "1"
+        clean_env["CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"] = "1"
+        clean_env["HISTFILE"] = os.devnull
+        clean_env["HISTSIZE"] = "0"
+        clean_env["SAVEHIST"] = "0"
+        clean_env["NODE_REPL_HISTORY"] = ""
+        clean_env["PYTHONHISTFILE"] = os.devnull
+        clean_env["DO_NOT_TRACK"] = "1"
+        clean_env["ANONYMIZED_TELEMETRY"] = "false"
         clean_env["CI"] = "true"
         return clean_env
 
@@ -273,8 +392,7 @@ class LocalCLIBridge:
             if err_tag:
                 return err_tag, 0
             if res.returncode != 0:
-                err_msg = (res.stderr or "").strip()[:200] or f"Process returned exit code {res.returncode}"
-                logger.warning("%s CLI 執行異常: %s", provider, err_msg)
+                logger.warning("%s CLI 執行異常 (exit_code=%s)，已省略原始錯誤輸出以保護對話隱私", provider, res.returncode)
                 return f"__ERROR__:AUTH_REQUIRED:{provider}", 0
 
             raw_output = (res.stdout or "").strip()
@@ -285,13 +403,15 @@ class LocalCLIBridge:
             return output, token_count
         except subprocess.TimeoutExpired:
             return f"__QUOTA_EXHAUSTED__:{provider}", 0
-        except Exception as e:
-            logger.warning("%s CLI 呼叫失敗: %s", provider, e)
+        except Exception:
+            logger.warning("%s CLI 呼叫失敗，已省略異常細節以保護對話隱私", provider)
             return f"__ERROR__:AUTH_REQUIRED:{provider}", 0
 
     @classmethod
     def execute_claude_code(cls, prompt: str, model: str = "default", timeout: float = 60.0) -> Tuple[str, int]:
         """調用本機 OAuth 授權之 Claude Code CLI（停用工具 + plan 權限模式 + 獨立目錄執行）。"""
+        if model and not is_valid_model_name(model):
+            return "__ERROR__:INVALID_MODEL", 0
         is_safe, clean_prompt = sanitize_prompt(prompt)
         if not is_safe:
             return "__ERROR__:TOS_REJECTED", 0
@@ -317,6 +437,8 @@ class LocalCLIBridge:
     @classmethod
     def execute_codex(cls, prompt: str, model: str = "default", timeout: float = 60.0) -> Tuple[str, int]:
         """調用本機 OAuth 授權之 OpenAI Codex CLI（指定 read-only 與 ephemeral 參數 + 獨立目錄執行）。"""
+        if model and not is_valid_model_name(model):
+            return "__ERROR__:INVALID_MODEL", 0
         is_safe, clean_prompt = sanitize_prompt(prompt)
         if not is_safe:
             return "__ERROR__:TOS_REJECTED", 0
@@ -339,6 +461,8 @@ class LocalCLIBridge:
     @classmethod
     def execute_gemini_cli(cls, prompt: str, model: str = "default", timeout: float = 60.0) -> Tuple[str, int]:
         """調用本機 Google OAuth 授權之 Gemini CLI（指定 sandbox 與 plan 模式 + 停用擴充 + 獨立目錄執行）。"""
+        if model and not is_valid_model_name(model):
+            return "__ERROR__:INVALID_MODEL", 0
         is_safe, clean_prompt = sanitize_prompt(prompt)
         if not is_safe:
             return "__ERROR__:TOS_REJECTED", 0
@@ -357,15 +481,32 @@ class LocalCLIBridge:
         return cls._run_sandboxed_cli(cmd, clean_prompt, "gemini_cli", timeout)
 
 
+def _is_safe_endpoint_url(url: str) -> bool:
+    """驗證目標伺服器 URL：遠端連線強制要求 https://，僅本機迴路 (localhost / 127.0.0.1 / ::1) 允許 http://。"""
+    try:
+        parsed = urllib.parse.urlparse(url)
+        if parsed.scheme == "https" and bool(parsed.netloc):
+            return True
+        if parsed.scheme == "http" and (parsed.hostname or "").lower() in ("localhost", "127.0.0.1", "::1"):
+            return True
+    except Exception:
+        pass
+    return False
+
+
 def _http_post(
     url: str,
     payload: Dict[str, Any],
     timeout: float = 10.0,
     token: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
-    """以 Python 內建標準庫執行 HTTP POST（僅使用標準庫，macOS / Windows 開箱即跑）。"""
+    """以 Python 內建標準庫執行 HTTP POST（強制驗證 HTTPS 或本機迴路，並阻擋跨網域轉址憑證外洩）。"""
+    if not _is_safe_endpoint_url(url):
+        logger.error("🚨 安全攔截：拒絕連線至非 HTTPS 之遠端不安全網址 (%s)", url)
+        return None
+    req_parsed = urllib.parse.urlparse(url)
     data_bytes = json.dumps(payload).encode("utf-8")
-    headers = {"Content-Type": "application/json", "User-Agent": "berich-oauth-worker/3.0"}
+    headers = {"Content-Type": "application/json", "User-Agent": "berich-oauth-worker/3.1-e2ee"}
     if token:
         headers["Authorization"] = f"Bearer {token}"
         headers["X-OAuth-Token"] = token
@@ -377,15 +518,29 @@ def _http_post(
     )
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
+            resp_url = getattr(resp, "url", None) or (resp.geturl() if hasattr(resp, "geturl") else url)
+            if isinstance(resp_url, str) and resp_url:
+                resp_parsed = urllib.parse.urlparse(resp_url)
+                if (resp_parsed.scheme, resp_parsed.netloc) != (req_parsed.scheme, req_parsed.netloc):
+                    logger.error("🚨 安全攔截：偵測到跨網域或降級轉址 (%s -> %s)，已阻斷回應！", url, resp_url)
+                    return None
             if resp.status == 200:
                 body = resp.read(MAX_HTTP_RESPONSE_BYTES).decode("utf-8", errors="replace")
                 return json.loads(body)
     except urllib.error.HTTPError as e:
-        logger.error("HTTP 錯誤 %s: %s", e.code, e.reason)
+        err_msg = str(e.reason)
+        try:
+            err_body = e.read(MAX_HTTP_RESPONSE_BYTES).decode("utf-8", errors="replace")
+            err_json = json.loads(err_body)
+            err_msg = err_json.get("detail") or err_json.get("message") or err_msg
+        except Exception:
+            pass
+        logger.error("HTTP 錯誤 %s: %s", e.code, redact_sensitive_pii(str(err_msg)))
         if e.code in (401, 403):
-            return {"status": "revoked", "error": "AUTH_FATAL", "code": e.code, "message": str(e.reason)}
+            return {"status": "revoked", "error": "AUTH_FATAL", "code": e.code, "message": err_msg}
+        return {"status": "error", "error": "HTTP_ERROR", "code": e.code, "message": err_msg}
     except Exception as e:
-        logger.warning("連線伺服器異常 (%s): %s", url, e)
+        logger.warning("連線伺服器異常 (%s): %s", url, redact_sensitive_pii(str(e)))
     return None
 
 
@@ -403,8 +558,11 @@ def run_node_worker(
     oauth_token: Optional[str] = None,
     trigger_oauth_login: bool = False,
 ):
-    """啟動跨平台 OAuth 訂閱額度共享節點常駐循環。"""
+    """啟動跨平台 OAuth 訂閱額度共享節點常駐循環（全程強制 br_enc_v1 端對端對話內容認證加密）。"""
     server_url = server_url.rstrip("/")
+    if not _is_safe_endpoint_url(server_url):
+        logger.error("❌ 拒絕啟動：遠端伺服器必須使用 https:// 加密連線 (%s)", server_url)
+        return
     register_url = f"{server_url}/api/compute/nodes/register"
     heartbeat_url = f"{server_url}/api/compute/nodes/heartbeat"
     claim_url = f"{server_url}/api/compute/tasks/claim"
@@ -421,14 +579,17 @@ def run_node_worker(
     # 若指定了 berich 網頁核發的 OAuth Worker Token，先向後端驗證並取得綁定之會員/錢包資訊
     if oauth_token:
         verify_url = f"{server_url}/api/compute/oauth/verify_worker"
+        req_nid = node_id if (node_id and not node_id.startswith("node-")) else None
+        v_payload = {
+            "oauth_token": oauth_token,
+            "provider_type": ",".join(selected_provs),
+            "os_name": platform.system(),
+        }
+        if req_nid:
+            v_payload["node_id"] = req_nid
         v_res = _http_post(
             verify_url,
-            {
-                "oauth_token": oauth_token,
-                "node_id": node_id,
-                "provider_type": ",".join(selected_provs),
-                "os_name": platform.system(),
-            },
+            v_payload,
             token=oauth_token,
         )
         if v_res and (v_res.get("valid_token") or v_res.get("status") in ("verified", "online", "waiting")):
@@ -440,6 +601,8 @@ def run_node_worker(
             err_msg = (v_res.get("message") if v_res else None) or "憑證驗證失敗或已被撤銷"
             logger.error("❌ 節點憑證驗證失敗: %s", err_msg)
             return
+
+    session_secret = derive_node_session_secret(node_id, oauth_token)
 
     # 依多選訂閱類型自動合併候選模型清單
     if not supported_models:
@@ -462,15 +625,16 @@ def run_node_worker(
         "arch": platform.machine(),
         "host_hash": anon_host,
         "auth_mode": "oauth_subscription",
+        "e2ee_protocol": "br_enc_v1",
         "selected_providers": selected_provs,
         "detected_clis": list(LocalCLIBridge.detect_available_clis().keys()),
-        "oauth_token": oauth_token,
     }
 
     logger.info("====================================================")
     logger.info("  💻 berich 跨平台 OAuth 訂閱額度共享節點 (macOS / Windows)")
     logger.info("  作業系統: %s (%s)", system_info["os"], system_info["arch"])
     logger.info("  節點 ID : %s", node_id)
+    logger.info("  對話加密: br_enc_v1 (HKDF-SHA256 + CTR + HMAC-SHA256 全程加密)")
     logger.info("  訂閱類型: %s (支援多訂閱同時共享)", ", ".join(selected_provs))
     logger.info("  支援模型: %s", ", ".join(supported_models))
     logger.info("  閒置守護: %s (閒置門檻 %.0fs，僅啟用時生效)", "啟用" if idle_only else "全時段接單", idle_threshold)
@@ -569,15 +733,73 @@ def run_node_worker(
 
             claim_res = _http_post(claim_url, {"node_id": node_id, "oauth_token": oauth_token}, token=oauth_token)
             if claim_res and claim_res.get("has_task"):
-                task_id = claim_res["task_id"]
-                prompt = claim_res["prompt"]
+                task_id = str(claim_res.get("task_id") or "")
+                raw_envelope = str(claim_res.get("encrypted_prompt") or claim_res.get("prompt") or "")
                 model = (claim_res.get("model") or "default").lower()
-                logger.info("⚡ 收到外部聚合 API 請求任務: %s (模型: %s)", task_id, model)
+
+                if not is_valid_model_name(model):
+                    logger.error("🚨 安全攔截：任務 %s 模型名稱格式異常 (%r)，拒絕執行！", task_id, model)
+                    _http_post(
+                        submit_url,
+                        {
+                            "node_id": node_id,
+                            "task_id": task_id,
+                            "result": "",
+                            "token_count": 0,
+                            "error": "INVALID_MODEL",
+                            "oauth_token": oauth_token,
+                        },
+                        token=oauth_token,
+                    )
+                    continue
+
+                if not raw_envelope.startswith(ENC_ENVELOPE_PREFIX):
+                    logger.error("🚨 安全攔截：任務 %s 未採用 br_enc_v1 端對端加密信封，拒絕執行明文任務！", task_id)
+                    _http_post(
+                        submit_url,
+                        {
+                            "node_id": node_id,
+                            "task_id": task_id,
+                            "result": "",
+                            "token_count": 0,
+                            "error": "E2EE_REQUIRED",
+                            "oauth_token": oauth_token,
+                        },
+                        token=oauth_token,
+                    )
+                    continue
+
+                try:
+                    prompt = decrypt_conversation_payload(
+                        envelope=raw_envelope,
+                        secret_key=session_secret,
+                        task_id=task_id,
+                        node_id=node_id,
+                        direction="claim",
+                    )
+                except ValueError as e:
+                    logger.error("🚨 安全攔截：任務 %s 對話密文 HMAC 驗簽失敗 (%s)，拒絕執行！", task_id, e)
+                    _http_post(
+                        submit_url,
+                        {
+                            "node_id": node_id,
+                            "task_id": task_id,
+                            "result": "",
+                            "token_count": 0,
+                            "error": "E2EE_DECRYPT_FAILED",
+                            "oauth_token": oauth_token,
+                        },
+                        token=oauth_token,
+                    )
+                    continue
+
+                logger.info("⚡ 收到加密聚合任務: %s (模型: %s | 驗證 br_enc_v1 通過)", task_id, model)
 
                 # 若領取任務瞬間號主操作滑鼠/鍵盤，立即退回任務 (TASK_YIELDED)
                 if idle_only:
                     cur_idle = get_system_idle_seconds()
                     if cur_idle is None or cur_idle < idle_threshold:
+                        prompt = ""
                         logger.info("🛑 偵測到號主操作電腦或閒置偵測失效 (cur_idle=%s)，立即退回任務 %s 交由下一位節點接手...", cur_idle, task_id)
                         _http_post(
                             submit_url,
@@ -618,6 +840,8 @@ def run_node_worker(
                 else:
                     output_text, token_count = f"__ERROR__:AUTH_REQUIRED:{target_prov}", 0
 
+                # 執行完畢立即抹除本機記憶體中之明文 Prompt 參照
+                prompt = ""
                 elapsed = time.time() - start_exec
 
                 if output_text.startswith("__QUOTA_EXHAUSTED__") or output_text.startswith("__ERROR__:"):
@@ -642,10 +866,21 @@ def run_node_worker(
                     _http_post(submit_url, submit_payload, token=oauth_token)
                     continue
 
+                encrypted_result = encrypt_conversation_payload(
+                    plaintext=output_text,
+                    secret_key=session_secret,
+                    task_id=task_id,
+                    node_id=node_id,
+                    direction="submit",
+                )
+                output_text = ""
+
                 submit_payload = {
                     "node_id": node_id,
                     "task_id": task_id,
-                    "result": output_text,
+                    "result": encrypted_result,
+                    "encrypted_result": encrypted_result,
+                    "encryption": "br_enc_v1",
                     "token_count": token_count,
                     "oauth_token": oauth_token,
                 }
@@ -657,7 +892,7 @@ def run_node_worker(
                 if sub_res and sub_res.get("status") == "success":
                     total_earned = float(sub_res.get("credits_earned", 0.0))
                     logger.info(
-                        "🎉 任務 %s 完成回傳！耗時 %.2fs | 貢獻 %d 訂閱額度 Tokens | 累計貢獻點數: %.2f (已登入會員在線享台股 VIP 與互助額度)",
+                        "🎉 任務 %s 加密回傳完成！耗時 %.2fs | 貢獻 %d 訂閱額度 Tokens | 累計貢獻點數: %.2f (已登入會員在線享台股 VIP 與互助額度)",
                         task_id,
                         elapsed,
                         token_count,

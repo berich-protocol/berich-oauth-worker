@@ -11,11 +11,19 @@
 """
 
 import json
+import secrets
 import threading
 import time
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Dict, List, Optional, Tuple
+
+from berich_worker import (
+    ENC_ENVELOPE_PREFIX,
+    decrypt_conversation_payload,
+    derive_node_session_secret,
+    encrypt_conversation_payload,
+)
 
 PROVIDER_MULTIPLIERS = {
     "claude_code": 12.0,
@@ -23,21 +31,31 @@ PROVIDER_MULTIPLIERS = {
     "gemini_cli": 8.0,
 }
 
+# 伺服器程序專屬之暫態記憶體加密金鑰（每次啟動隨機生成，重啟即銷毀）
+_SERVER_MEM_KEY = f"berich-server-ram:{secrets.token_hex(32)}"
+
 
 class ReferenceGatewayState:
-    """記憶體內算力調度與 OpenAI 相容網關狀態機。"""
+    """記憶體內算力調度與 OpenAI 相容網關狀態機（對話內容全程加密且用畢即焚）。"""
 
     def __init__(self) -> None:
         self.lock = threading.Lock()
         self.nodes: Dict[str, Dict[str, Any]] = {}
         self.tasks: Dict[str, Dict[str, Any]] = {}
         self.task_events: Dict[str, threading.Event] = {}
+        self._node_secrets: Dict[str, str] = {}
+
+    def _get_node_secret(self, node_id: str, oauth_token: Optional[str] = None) -> str:
+        tok = (oauth_token or "").strip() or self._node_secrets.get(node_id, "")
+        return derive_node_session_secret(node_id, tok or None)
 
     def verify_worker(self, oauth_token: str, node_id: str, provider_type: str, os_name: str) -> Dict[str, Any]:
         providers = [p.strip().lower() for p in provider_type.split(",") if p.strip()]
         if not providers:
             providers = ["claude_code"]
         with self.lock:
+            if oauth_token:
+                self._node_secrets[node_id] = oauth_token.strip()
             bonus = 50.0 * len(providers)
             existing = self.nodes.get(node_id, {})
             self.nodes[node_id] = {
@@ -68,17 +86,23 @@ class ReferenceGatewayState:
         provider_type: str,
         supported_models: List[str],
         metadata: Dict[str, Any],
+        oauth_token: Optional[str] = None,
     ) -> Dict[str, Any]:
         with self.lock:
             existing = self.nodes.get(node_id, {})
-            selected_provs = metadata.get("selected_providers") or [provider_type]
+            raw_meta = dict(metadata or {})
+            meta_tok = raw_meta.pop("oauth_token", None)
+            tok = (oauth_token or meta_tok or "").strip()
+            if tok:
+                self._node_secrets[node_id] = tok
+            selected_provs = raw_meta.get("selected_providers") or [provider_type]
             self.nodes[node_id] = {
                 "node_id": node_id,
                 "node_name": node_name,
                 "provider_type": provider_type,
                 "selected_providers": selected_provs,
                 "supported_models": supported_models,
-                "metadata": metadata,
+                "metadata": raw_meta,
                 "credits_earned": existing.get("credits_earned", 0.0),
                 "tasks_completed": existing.get("tasks_completed", 0),
                 "total_tokens": existing.get("total_tokens", 0),
@@ -103,7 +127,7 @@ class ReferenceGatewayState:
                 self.nodes[node_id]["last_seen"] = time.time()
             return {"status": "ok", "node_id": node_id}
 
-    def claim_task(self, node_id: str) -> Dict[str, Any]:
+    def claim_task(self, node_id: str, oauth_token: Optional[str] = None) -> Dict[str, Any]:
         now = time.time()
         with self.lock:
             node = self.nodes.get(node_id)
@@ -138,10 +162,29 @@ class ReferenceGatewayState:
                         task["assigned_node_id"] = node_id
                         task["assigned_at"] = now
                         node["status"] = "busy"
+
+                        # 從伺服器記憶體密文解密後，立即以目標節點專屬會話金鑰重新加密封裝 (br_enc_v1)
+                        plaintext_prompt = decrypt_conversation_payload(
+                            envelope=task["encrypted_prompt_ram"],
+                            secret_key=_SERVER_MEM_KEY,
+                            task_id=task_id,
+                            node_id="server_ram",
+                            direction="ram_prompt",
+                        )
+                        node_secret = self._get_node_secret(node_id, oauth_token)
+                        wire_encrypted_prompt = encrypt_conversation_payload(
+                            plaintext=plaintext_prompt,
+                            secret_key=node_secret,
+                            task_id=task_id,
+                            node_id=node_id,
+                            direction="claim",
+                        )
                         return {
                             "has_task": True,
                             "task_id": task_id,
-                            "prompt": task["prompt"],
+                            "prompt": wire_encrypted_prompt,
+                            "encrypted_prompt": wire_encrypted_prompt,
+                            "encryption": "br_enc_v1",
                             "model": task["model"],
                         }
             return {"has_task": False}
@@ -153,6 +196,7 @@ class ReferenceGatewayState:
         result: str,
         token_count: int,
         error: Optional[str] = None,
+        oauth_token: Optional[str] = None,
     ) -> Dict[str, Any]:
         now = time.time()
         with self.lock:
@@ -201,8 +245,29 @@ class ReferenceGatewayState:
                     "failover_count": task["failover_count"],
                 }
 
+            # 強制驗證並解密節點回傳之 br_enc_v1 加密對話回應
+            if not isinstance(result, str) or not result.startswith(ENC_ENVELOPE_PREFIX):
+                return {"status": "error", "message": "Unencrypted result rejected: br_enc_v1 required"}
+            node_secret = self._get_node_secret(node_id, oauth_token)
+            try:
+                decrypted_result = decrypt_conversation_payload(
+                    envelope=result,
+                    secret_key=node_secret,
+                    task_id=task_id,
+                    node_id=node_id,
+                    direction="submit",
+                )
+            except ValueError as exc:
+                return {"status": "error", "message": f"E2EE verification failed: {exc}"}
+
             task["status"] = "completed"
-            task["result"] = result
+            task["encrypted_result_ram"] = encrypt_conversation_payload(
+                plaintext=decrypted_result,
+                secret_key=_SERVER_MEM_KEY,
+                task_id=task_id,
+                node_id="server_ram",
+                direction="ram_result",
+            )
             task["token_count"] = token_count
             task["completed_at"] = now
             node["status"] = "online"
@@ -254,16 +319,25 @@ class ReferenceGatewayState:
 
     def dispatch_openai_chat(self, model: str, messages: List[Dict[str, str]], timeout: float = 15.0) -> Dict[str, Any]:
         prompt = self.build_stateless_context_prompt(messages)
+        prompt_len = len(prompt)
         task_id = f"task_{uuid.uuid4().hex[:10]}"
         ev = threading.Event()
+        encrypted_prompt_ram = encrypt_conversation_payload(
+            plaintext=prompt,
+            secret_key=_SERVER_MEM_KEY,
+            task_id=task_id,
+            node_id="server_ram",
+            direction="ram_prompt",
+        )
+        prompt = ""
 
         with self.lock:
             self.tasks[task_id] = {
                 "task_id": task_id,
                 "model": model,
-                "prompt": prompt,
+                "encrypted_prompt_ram": encrypted_prompt_ram,
                 "status": "pending",
-                "result": None,
+                "encrypted_result_ram": None,
                 "token_count": 0,
                 "assigned_node_id": None,
                 "failed_node_ids": [],
@@ -274,12 +348,23 @@ class ReferenceGatewayState:
 
         completed = ev.wait(timeout=timeout)
         with self.lock:
-            task = self.tasks[task_id]
+            # 任務結束或逾時後，立即從伺服器記憶體佇列徹底抹除 (Zero-Retention Ephemeral Wipe)
+            task = self.tasks.pop(task_id, None)
             self.task_events.pop(task_id, None)
-            if not completed or task["status"] != "completed":
+            if not completed or not task or task["status"] != "completed" or not task.get("encrypted_result_ram"):
                 raise TimeoutError(f"Task {task_id} timed out waiting for worker node")
 
-            prompt_tokens = max(10, len(prompt) // 3)
+            final_reply = decrypt_conversation_payload(
+                envelope=task["encrypted_result_ram"],
+                secret_key=_SERVER_MEM_KEY,
+                task_id=task_id,
+                node_id="server_ram",
+                direction="ram_result",
+            )
+            task["encrypted_prompt_ram"] = ""
+            task["encrypted_result_ram"] = ""
+
+            prompt_tokens = max(10, prompt_len // 3)
             completion_tokens = max(20, task["token_count"] - prompt_tokens)
             return {
                 "id": f"chatcmpl-{task_id}",
@@ -291,7 +376,7 @@ class ReferenceGatewayState:
                         "index": 0,
                         "message": {
                             "role": "assistant",
-                            "content": task["result"],
+                            "content": final_reply,
                         },
                         "finish_reason": "stop",
                     }
@@ -304,6 +389,8 @@ class ReferenceGatewayState:
                 "berich_routing": {
                     "routed_node_id": task["assigned_node_id"],
                     "auth_mode": "oauth_subscription_sandbox",
+                    "e2ee_protocol": "br_enc_v1",
+                    "ephemeral_wiped": True,
                     "task_id": task_id,
                     "failover_count": task.get("failover_count", 0),
                     "failed_over_from": list(task.get("failed_node_ids", [])),
@@ -370,6 +457,7 @@ def create_gateway_server(host: str = "127.0.0.1", port: int = 0) -> Tuple[Threa
                     provider_type=payload.get("provider_type", "claude_code"),
                     supported_models=payload.get("supported_models") or ["default"],
                     metadata=payload.get("metadata") or {},
+                    oauth_token=payload.get("oauth_token"),
                 )
                 self._send_json(res)
             elif self.path == "/api/compute/nodes/bind_wallet":
@@ -379,17 +467,22 @@ def create_gateway_server(host: str = "127.0.0.1", port: int = 0) -> Tuple[Threa
                 res = state.heartbeat(payload["node_id"])
                 self._send_json(res)
             elif self.path == "/api/compute/tasks/claim":
-                res = state.claim_task(payload["node_id"])
+                res = state.claim_task(
+                    node_id=payload["node_id"],
+                    oauth_token=payload.get("oauth_token"),
+                )
                 self._send_json(res)
             elif self.path == "/api/compute/tasks/submit":
                 res = state.submit_task(
                     node_id=payload["node_id"],
                     task_id=payload["task_id"],
-                    result=payload["result"],
+                    result=payload.get("encrypted_result") or payload.get("result", ""),
                     token_count=int(payload.get("token_count", 100)),
                     error=payload.get("error"),
+                    oauth_token=payload.get("oauth_token"),
                 )
-                self._send_json(res)
+                status_code = 400 if res.get("status") == "error" else 200
+                self._send_json(res, status=status_code)
             elif self.path in ("/v1/chat/completions", "/api/compute/v1/chat/completions"):
                 auth = self.headers.get("Authorization", "")
                 if not auth.startswith("Bearer sk-berich-"):
